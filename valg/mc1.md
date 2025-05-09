@@ -127,3 +127,8 @@ flowchart TD
 ## Note: 
 * Memcheck does not track the stack size explicitly, nor does it maintain a running count of the allocated stack space. Instead, it marks regions of memory as undefined, defined, or noaccess in shadow memory during function entry and exit. Thus, to determine stack size, you would need to analyze the shadow memory to identify all regions currently marked as stack-origin (using origin tags) and count the regions that are not marked as noaccess. This approach is indirect and does not involve the Stack Pointer directly.
 
+* To check the size of the stack currently in use, check the sum of `n_undefined_SMs` and `n_defined_SMs` for regions tagged as `stack-origin`.
+
+* To check the size of the heap currently in use, sum the size fields of all active `MC_Chunk` entries in the `malloc_list`.
+
+

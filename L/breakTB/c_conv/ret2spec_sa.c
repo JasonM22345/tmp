@@ -3,8 +3,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
 
-#include "measurereadlatency.h"  
+#include "asm/measurereadlatency.h"  
 
 // Cache line and page size (used for alignment and flushing)
 #define CACHE_LINE_SIZE 64

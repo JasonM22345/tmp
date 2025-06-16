@@ -10,19 +10,17 @@
 #ifndef DEMOS_ASM_MEASUREREADLATENCY_H_
 #define DEMOS_ASM_MEASUREREADLATENCY_H_
 
-#include <cstdint>
+#include <stdint.h>
 
-// Reads a byte from *address and returns a measure of how long it took by
-// sampling a platform timer before and after the read.
-//
-// The measurement may include the time it took to execute some other
-// instructions, but implementations go to some trouble to ensure all
-// *variability* across measurements is due to the latency of the memory read.
-//
-// See README.md and platform-specific implementations for more discussion.
-//
-// Will return spuriously high results if e.g. the thread is preempted while
-// measuring the read.
-extern "C" uint64_t MeasureReadLatency(const void* address);
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Reads a byte from *address and returns the memory read latency in cycles.
+uint64_t MeasureReadLatency(const void* address);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // DEMOS_ASM_MEASUREREADLATENCY_H_

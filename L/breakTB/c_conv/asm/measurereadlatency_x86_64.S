@@ -16,17 +16,16 @@
 
 .intel_syntax noprefix
 
-.global DECORATE(MeasureReadLatency)
+.global MeasureReadLatency
 // uint64_t MeasureReadLatency(const void* address);
-DECORATE(MeasureReadLatency):
+MeasureReadLatency:
   // rdi = address
 
-  // Full memory and speculation barrier. See docs/fencing.md for details.
+  // Full memory and speculation barrier
   mfence
   lfence
 
   // edx:eax = <time-stamp counter>
-  // RDTSC: https://cpu.fyi/d/484#G7.432796
   rdtsc
 
   // rax = edx:eax
@@ -39,12 +38,10 @@ DECORATE(MeasureReadLatency):
   // Finish reading the timestamp before starting the read.
   lfence
 
-  // Read *rdi.
+  // Read *rdi
   mov al, byte ptr [rdi]
 
-  // Finish the read before reading the timestamp again. LFENCE suffices here
-  // because it serializes the instruction stream *and* waits for load
-  // operations to complete.
+  // Finish the read before reading timestamp again
   lfence
 
   // edx:eax = <time-stamp counter>
